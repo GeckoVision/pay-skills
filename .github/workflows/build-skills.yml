@@ -16,6 +16,12 @@ on:
 env:
   PAY_IMAGE: ghcr.io/solana-foundation/pay:latest
 
+# Runs publish in push order. Publish deletes unmatched objects, so two
+# runs that overlap could otherwise delete what the other one published.
+concurrency:
+  group: build-skills-publish
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -56,7 +62,9 @@ jobs:
       # Detect provider directories whose contents changed in this push. We
       # diff from `github.event.before`, not `HEAD~1`, so every commit in a
       # multi-commit push counts. When that baseline cannot be proven (first
-      # push, force push, workflow_dispatch) we fall back to a full rebuild.
+      # push, force push, workflow_dispatch) we set `full=true` and the build
+      # rebuilds every provider; `files` then still holds only HEAD~1's
+      # changes, so the Solana-compat gate keeps its old scope.
       # We consider any file under `providers/` (not just PAY.md): a change to
       # a sidecar like `openapi.json` or `schemas/req.json` must rebuild the
       # owning provider's dist entry. For each changed file we walk up to the
@@ -69,31 +77,35 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
         run: |
+          FULL=false
+          BASE="$BEFORE"
           if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
              || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
              || ! git merge-base --is-ancestor "$BEFORE" HEAD; then
-            ALL_PAY=$(find providers -name PAY.md | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-            {
-              echo "full=true"
-              echo "files=$ALL_PAY"
-              echo "skip=false"
-            } >> "$GITHUB_OUTPUT"
+            FULL=true
+            BASE=$(git rev-parse --verify --quiet HEAD~1 || true)
             echo "No provable baseline for this push — full rebuild."
-            exit 0
           fi
-          echo "full=false" >> "$GITHUB_OUTPUT"
-          ALL=$(git diff --name-only --no-renames --diff-filter=ACMD "$BEFORE" HEAD -- 'providers/**')
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+          ALL=""
+          if [ -n "$BASE" ]; then
+            ALL=$(git diff --name-only --no-renames --diff-filter=ACMD "$BASE" HEAD -- 'providers/**')
+          fi
           PAY_FILES=""
           REMOVED_FILES=""
           for f in $ALL; do
+            # A deleted PAY.md is a removed provider, even when a parent
+            # directory still holds its own PAY.md.
+            if [ "$(basename "$f")" = "PAY.md" ] && [ ! -f "$f" ]; then
+              REMOVED_FILES="$REMOVED_FILES $f"
+              continue
+            fi
             dir="$f"
             while [ -n "$dir" ] && [ "$dir" != "providers" ] && [ "$dir" != "." ] && [ ! -f "$dir/PAY.md" ]; do
               dir=$(dirname "$dir")
             done
             if [ -f "$dir/PAY.md" ]; then
               PAY_FILES="$PAY_FILES $dir/PAY.md"
-            elif [ "$(basename "$f")" = "PAY.md" ]; then
-              REMOVED_FILES="$REMOVED_FILES $f"
             fi
           done
           UNIQ=$(echo $PAY_FILES | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
@@ -104,7 +116,7 @@ jobs:
             echo "Removed providers in this push:"
             for f in $REMOVED; do echo "  $f"; done
           fi
-          if [ -z "$UNIQ" ] && [ -z "$REMOVED" ]; then
+          if [ "$FULL" = "false" ] && [ -z "$UNIQ" ] && [ -z "$REMOVED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "No provider changes in this push."
           else
@@ -241,15 +253,25 @@ jobs:
 
       # `--delete-unmatched-destination-objects` removes a deleted provider's
       # detail JSON from the bucket, as circuit-breaker.yml already does.
-      # Publish only when HEAD is still the tip of main: a re-run of an older
-      # build would otherwise delete objects that newer pushes published.
+      # The concurrency group keeps first attempts in push order, so each one
+      # publishes. A re-run of an older build would delete objects that newer
+      # pushes published, so it fails instead. A dispatch from another branch
+      # builds but does not publish.
       - name: Publish to GCS
         if: steps.mode.outputs.mode == 'rebuild' || steps.changed.outputs.skip == 'false'
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          git fetch --quiet origin main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
-            echo "HEAD is not the tip of main — skipping publish."
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::notice::Built from $GITHUB_REF, not main — not publishing."
             exit 0
+          fi
+          if [ "$RUN_ATTEMPT" != "1" ]; then
+            git fetch --quiet origin main
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+              echo "::error::Re-run of $(git rev-parse --short HEAD), but main is at $(git rev-parse --short FETCH_HEAD). Publishing would delete newer objects; dispatch a run on main instead."
+              exit 1
+            fi
           fi
           gcloud storage rsync dist/ gs://pay-skills/v1/ \
             --recursive \
