@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Build mode — incremental (only providers changed in this commit) or rebuild (every provider)."
+        description: "Build mode — incremental or rebuild (every provider). A dispatch has no push baseline, so incremental also rebuilds every provider."
         type: choice
         options:
           - incremental
@@ -113,7 +113,7 @@ jobs:
             for f in $UNIQ; do echo "  $f"; done
           fi
 
-      # Re-run the Solana-compat gate against this merge's changes so a
+      # Re-run the Solana-compat gate against this push's changes so a
       # bypassed PR can't silently publish a broken provider. The PAY.md
       # list was already resolved in the previous step; pass it as
       # `--files` so we don't need git inside the container. A push that only
@@ -171,7 +171,7 @@ jobs:
       # Probe-driven build: each endpoint's pricing / protocol[] /
       # supported_usd is reconstructed from the live 402 challenge.
       #
-      # - `incremental` (default): only the providers changed in this commit
+      # - `incremental` (default): only the providers changed in this push
       #   are re-probed; everyone else is copied verbatim from the prior
       #   dist. Fast (seconds per provider) and idempotent.
       # - `rebuild` (manual): full re-resolve + re-probe of every provider.
@@ -241,9 +241,16 @@ jobs:
 
       # `--delete-unmatched-destination-objects` removes a deleted provider's
       # detail JSON from the bucket, as circuit-breaker.yml already does.
+      # Publish only when HEAD is still the tip of main: a re-run of an older
+      # build would otherwise delete objects that newer pushes published.
       - name: Publish to GCS
         if: steps.mode.outputs.mode == 'rebuild' || steps.changed.outputs.skip == 'false'
         run: |
+          git fetch --quiet origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            echo "HEAD is not the tip of main — skipping publish."
+            exit 0
+          fi
           gcloud storage rsync dist/ gs://pay-skills/v1/ \
             --recursive \
             --delete-unmatched-destination-objects \
