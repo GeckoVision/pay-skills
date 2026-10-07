@@ -27,9 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # Need at least one parent commit so we can diff what this merge
-          # actually changed (the Solana-compat re-gate + --only computation).
-          fetch-depth: 2
+          # Full history so we can diff from the commit before this push
+          # (`github.event.before`), however many commits the push carries
+          # (the Solana-compat re-gate + --only computation).
+          fetch-depth: 0
 
       - uses: google-github-actions/auth@v2
         with:
@@ -52,16 +53,38 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "Run mode: $MODE"
 
-      # Detect provider directories whose contents changed in this merge. We
-      # consider any file under `providers/` (not just PAY.md): a change to a
-      # sidecar like `openapi.json` or `schemas/req.json` must rebuild the
+      # Detect provider directories whose contents changed in this push. We
+      # diff from `github.event.before`, not `HEAD~1`, so every commit in a
+      # multi-commit push counts. When that baseline cannot be proven (first
+      # push, force push, workflow_dispatch) we fall back to a full rebuild.
+      # We consider any file under `providers/` (not just PAY.md): a change to
+      # a sidecar like `openapi.json` or `schemas/req.json` must rebuild the
       # owning provider's dist entry. For each changed file we walk up to the
       # nearest ancestor directory holding a PAY.md and emit that PAY.md.
-      - name: Detect providers changed in this commit
+      # Deletions count too: a deleted PAY.md is emitted under `removed` so
+      # the provider leaves the index, and `--no-renames` reports a moved
+      # provider as a deletion plus an addition.
+      - name: Detect providers changed in this push
         id: changed
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
-          ALL=$(git diff --name-only --diff-filter=ACMR HEAD~1...HEAD -- 'providers/**')
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+             || ! git merge-base --is-ancestor "$BEFORE" HEAD; then
+            ALL_PAY=$(find providers -name PAY.md | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            {
+              echo "full=true"
+              echo "files=$ALL_PAY"
+              echo "skip=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "No provable baseline for this push — full rebuild."
+            exit 0
+          fi
+          echo "full=false" >> "$GITHUB_OUTPUT"
+          ALL=$(git diff --name-only --no-renames --diff-filter=ACMD "$BEFORE" HEAD -- 'providers/**')
           PAY_FILES=""
+          REMOVED_FILES=""
           for f in $ALL; do
             dir="$f"
             while [ -n "$dir" ] && [ "$dir" != "providers" ] && [ "$dir" != "." ] && [ ! -f "$dir/PAY.md" ]; do
@@ -69,25 +92,34 @@ jobs:
             done
             if [ -f "$dir/PAY.md" ]; then
               PAY_FILES="$PAY_FILES $dir/PAY.md"
+            elif [ "$(basename "$f")" = "PAY.md" ]; then
+              REMOVED_FILES="$REMOVED_FILES $f"
             fi
           done
           UNIQ=$(echo $PAY_FILES | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+          REMOVED=$(echo $REMOVED_FILES | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
           echo "files=$UNIQ" >> "$GITHUB_OUTPUT"
-          if [ -z "$UNIQ" ]; then
+          echo "removed=$REMOVED" >> "$GITHUB_OUTPUT"
+          if [ -n "$REMOVED" ]; then
+            echo "Removed providers in this push:"
+            for f in $REMOVED; do echo "  $f"; done
+          fi
+          if [ -z "$UNIQ" ] && [ -z "$REMOVED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "No provider changes in this merge."
+            echo "No provider changes in this push."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Changed providers in this merge:"
+            echo "Changed providers in this push:"
             for f in $UNIQ; do echo "  $f"; done
           fi
 
       # Re-run the Solana-compat gate against this merge's changes so a
       # bypassed PR can't silently publish a broken provider. The PAY.md
       # list was already resolved in the previous step; pass it as
-      # `--files` so we don't need git inside the container.
+      # `--files` so we don't need git inside the container. A push that only
+      # removes providers has nothing to validate.
       - name: Solana-compat validation (gate)
-        if: steps.changed.outputs.skip == 'false'
+        if: steps.changed.outputs.files != ''
         env:
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
         run: |
@@ -123,12 +155,15 @@ jobs:
 
       - name: Compute --only FQNs for partial rebuild
         id: only
-        if: steps.mode.outputs.mode == 'incremental' && steps.prev.outputs.have_prev == 'true' && steps.changed.outputs.skip == 'false'
+        if: steps.mode.outputs.mode == 'incremental' && steps.prev.outputs.have_prev == 'true' && steps.changed.outputs.skip == 'false' && steps.changed.outputs.full != 'true'
         env:
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
+          REMOVED_FILES: ${{ steps.changed.outputs.removed }}
         run: |
-          # Translate "providers/<fqn>/PAY.md" → "<fqn>", comma-joined.
-          ONLY=$(echo "$CHANGED_FILES" | tr ' ' '\n' | \
+          # Translate "providers/<fqn>/PAY.md" → "<fqn>", comma-joined. A
+          # removed FQN has no PAY.md left to walk, so listing it rebuilds
+          # nothing; it keeps a removal-only push incremental.
+          ONLY=$(echo "$CHANGED_FILES $REMOVED_FILES" | tr ' ' '\n' | \
             sed -E 's|^providers/(.+)/PAY\.md$|\1|' | grep -v '^$' | paste -sd, -)
           echo "fqns=$ONLY" >> "$GITHUB_OUTPUT"
           echo "Partial rebuild scope: $ONLY"
@@ -204,11 +239,14 @@ jobs:
           name: skills-dist
           path: dist/
 
+      # `--delete-unmatched-destination-objects` removes a deleted provider's
+      # detail JSON from the bucket, as circuit-breaker.yml already does.
       - name: Publish to GCS
         if: steps.mode.outputs.mode == 'rebuild' || steps.changed.outputs.skip == 'false'
         run: |
           gcloud storage rsync dist/ gs://pay-skills/v1/ \
             --recursive \
+            --delete-unmatched-destination-objects \
             --cache-control="public, max-age=300" \
             --checksums-only
           gcloud storage cp dist/skills.json gs://pay-skills/v1/skills.json \
