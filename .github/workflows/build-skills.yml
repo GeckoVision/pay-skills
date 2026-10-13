@@ -79,6 +79,8 @@ jobs:
       # proven (none recorded, force push, `rebuild` mode) we set `full=true`
       # and the build rebuilds every provider; `files` then still holds only
       # HEAD~1's changes, so the Solana-compat gate keeps its old scope.
+      # A run whose commit is older than the published one is stale and
+      # skips build and publish.
       # We consider any file under `providers/` (not just PAY.md): a change to
       # a sidecar like `openapi.json` or `schemas/req.json` must rebuild the
       # owning provider's dist entry. For each changed file we walk up to the
@@ -93,6 +95,13 @@ jobs:
         run: |
           FULL=false
           BASE="$PUBLISHED"
+          if [ -n "$PUBLISHED" ] && [ "$PUBLISHED" != "$(git rev-parse HEAD)" ] \
+             && git merge-base --is-ancestor HEAD "$PUBLISHED" 2>/dev/null; then
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$(git rev-parse --short HEAD) is older than the published $(git rev-parse --short "$PUBLISHED") — not building."
+            exit 0
+          fi
           if [ -z "$PUBLISHED" ] \
              || ! git cat-file -e "$PUBLISHED^{commit}" 2>/dev/null \
              || ! git merge-base --is-ancestor "$PUBLISHED" HEAD; then
@@ -268,10 +277,12 @@ jobs:
       # `--delete-unmatched-destination-objects` removes a deleted provider's
       # detail JSON from the bucket, as circuit-breaker.yml already does.
       # After the sync, record the commit this dist was built from.
-      # The concurrency group keeps first attempts in push order, so each one
-      # publishes. A re-run of an older build would delete objects that newer
-      # pushes published, so it fails instead. A dispatch from another branch
-      # builds but does not publish.
+      # Only the tip of main publishes: an older build would delete objects
+      # that newer pushes published. A first attempt that is no longer the
+      # tip skips (the newer run publishes); a re-run of one fails. A push
+      # that lands after this check queues behind this run in the
+      # concurrency group and publishes after it, diffing from our record.
+      # A dispatch from another branch builds but does not publish.
       - name: Publish to GCS
         if: steps.mode.outputs.mode == 'rebuild' || steps.changed.outputs.skip == 'false'
         env:
@@ -281,12 +292,14 @@ jobs:
             echo "::notice::Built from $GITHUB_REF, not main — not publishing."
             exit 0
           fi
-          if [ "$RUN_ATTEMPT" != "1" ]; then
-            git fetch --quiet origin main
-            if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
-              echo "::error::Re-run of $(git rev-parse --short HEAD), but main is at $(git rev-parse --short FETCH_HEAD). Publishing would delete newer objects; dispatch a run on main instead."
-              exit 1
+          git fetch --quiet origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            if [ "$RUN_ATTEMPT" = "1" ]; then
+              echo "::notice::$(git rev-parse --short HEAD) is not the tip of main ($(git rev-parse --short FETCH_HEAD)) — not publishing; the newer run publishes."
+              exit 0
             fi
+            echo "::error::Re-run of $(git rev-parse --short HEAD), but main is at $(git rev-parse --short FETCH_HEAD). Publishing would delete newer objects; dispatch a run on main instead."
+            exit 1
           fi
           gcloud storage rsync dist/ gs://pay-skills/v1/ \
             --recursive \
