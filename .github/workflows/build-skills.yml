@@ -80,7 +80,8 @@ jobs:
       # and the build rebuilds every provider; `files` then still holds only
       # HEAD~1's changes, so the Solana-compat gate keeps its old scope.
       # A run whose commit is older than the published one is stale and
-      # skips build and publish.
+      # skips build and publish, unless it is the tip of main: then main
+      # was rolled back, and it takes the full-rebuild path.
       # We consider any file under `providers/` (not just PAY.md): a change to
       # a sidecar like `openapi.json` or `schemas/req.json` must rebuild the
       # owning provider's dist entry. For each changed file we walk up to the
@@ -97,10 +98,14 @@ jobs:
           BASE="$PUBLISHED"
           if [ -n "$PUBLISHED" ] && [ "$PUBLISHED" != "$(git rev-parse HEAD)" ] \
              && git merge-base --is-ancestor HEAD "$PUBLISHED" 2>/dev/null; then
-            echo "full=false" >> "$GITHUB_OUTPUT"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$(git rev-parse --short HEAD) is older than the published $(git rev-parse --short "$PUBLISHED") — not building."
-            exit 0
+            git fetch --quiet origin main
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+              echo "full=false" >> "$GITHUB_OUTPUT"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::$(git rev-parse --short HEAD) is older than the published $(git rev-parse --short "$PUBLISHED") — not building."
+              exit 0
+            fi
+            echo "::notice::main was rolled back below the published $(git rev-parse --short "$PUBLISHED") — full rebuild."
           fi
           if [ -z "$PUBLISHED" ] \
              || ! git cat-file -e "$PUBLISHED^{commit}" 2>/dev/null \
