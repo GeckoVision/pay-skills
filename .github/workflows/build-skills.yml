@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Build mode — incremental or rebuild (every provider). A dispatch has no push baseline, so incremental also rebuilds every provider."
+        description: "Build mode — incremental (providers changed since the last publish) or rebuild (every provider)."
         type: choice
         options:
           - incremental
@@ -33,10 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # Full history so we can diff from the commit before this push
-          # (`github.event.before`), however many commits the push carries
-          # (the Solana-compat re-gate + --only computation).
+          # Full history so we can diff from the last published commit,
+          # however far back it is (the Solana-compat re-gate + --only
+          # computation). Commits and trees only; blobs load on demand.
           fetch-depth: 0
+          filter: blob:none
 
       - uses: google-github-actions/auth@v2
         with:
@@ -59,12 +60,25 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "Run mode: $MODE"
 
-      # Detect provider directories whose contents changed in this push. We
-      # diff from `github.event.before`, not `HEAD~1`, so every commit in a
-      # multi-commit push counts. When that baseline cannot be proven (first
-      # push, force push, workflow_dispatch) we set `full=true` and the build
-      # rebuilds every provider; `files` then still holds only HEAD~1's
-      # changes, so the Solana-compat gate keeps its old scope.
+      # Read the commit the last publish was built from. It lives outside
+      # v1/, so the circuit breaker's delete-sync leaves it in place.
+      # `rebuild` mode skips it and rebuilds every provider.
+      - name: Read last published commit (incremental mode only)
+        id: published
+        if: steps.mode.outputs.mode == 'incremental'
+        continue-on-error: true
+        run: |
+          if gcloud storage cp gs://pay-skills/state/source-sha source-sha 2>/dev/null; then
+            echo "sha=$(tr -dc '0-9a-f' < source-sha | head -c 40)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Detect provider directories changed since the last publish. We diff
+      # from the commit that publish was built from, not `HEAD~1`, so every
+      # commit counts: several in one push, a push whose queued run was
+      # cancelled, or one whose publish failed. When that commit cannot be
+      # proven (none recorded, force push, `rebuild` mode) we set `full=true`
+      # and the build rebuilds every provider; `files` then still holds only
+      # HEAD~1's changes, so the Solana-compat gate keeps its old scope.
       # We consider any file under `providers/` (not just PAY.md): a change to
       # a sidecar like `openapi.json` or `schemas/req.json` must rebuild the
       # owning provider's dist entry. For each changed file we walk up to the
@@ -72,19 +86,19 @@ jobs:
       # Deletions count too: a deleted PAY.md is emitted under `removed` so
       # the provider leaves the index, and `--no-renames` reports a moved
       # provider as a deletion plus an addition.
-      - name: Detect providers changed in this push
+      - name: Detect providers changed since the last publish
         id: changed
         env:
-          BEFORE: ${{ github.event.before }}
+          PUBLISHED: ${{ steps.published.outputs.sha }}
         run: |
           FULL=false
-          BASE="$BEFORE"
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
-             || ! git merge-base --is-ancestor "$BEFORE" HEAD; then
+          BASE="$PUBLISHED"
+          if [ -z "$PUBLISHED" ] \
+             || ! git cat-file -e "$PUBLISHED^{commit}" 2>/dev/null \
+             || ! git merge-base --is-ancestor "$PUBLISHED" HEAD; then
             FULL=true
             BASE=$(git rev-parse --verify --quiet HEAD~1 || true)
-            echo "No provable baseline for this push — full rebuild."
+            echo "No published commit to diff from — full rebuild."
           fi
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
           ALL=""
@@ -113,15 +127,15 @@ jobs:
           echo "files=$UNIQ" >> "$GITHUB_OUTPUT"
           echo "removed=$REMOVED" >> "$GITHUB_OUTPUT"
           if [ -n "$REMOVED" ]; then
-            echo "Removed providers in this push:"
+            echo "Removed providers since the last publish:"
             for f in $REMOVED; do echo "  $f"; done
           fi
           if [ "$FULL" = "false" ] && [ -z "$UNIQ" ] && [ -z "$REMOVED" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "No provider changes in this push."
+            echo "No provider changes since the last publish."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Changed providers in this push:"
+            echo "Changed providers since the last publish:"
             for f in $UNIQ; do echo "  $f"; done
           fi
 
@@ -253,6 +267,7 @@ jobs:
 
       # `--delete-unmatched-destination-objects` removes a deleted provider's
       # detail JSON from the bucket, as circuit-breaker.yml already does.
+      # After the sync, record the commit this dist was built from.
       # The concurrency group keeps first attempts in push order, so each one
       # publishes. A re-run of an older build would delete objects that newer
       # pushes published, so it fails instead. A dispatch from another branch
@@ -280,3 +295,5 @@ jobs:
             --checksums-only
           gcloud storage cp dist/skills.json gs://pay-skills/v1/skills.json \
             --cache-control="public, max-age=60"
+          git rev-parse HEAD > source-sha
+          gcloud storage cp source-sha gs://pay-skills/state/source-sha
